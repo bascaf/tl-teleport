@@ -1,0 +1,552 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local mouse = player:GetMouse()
+local backpack = player:WaitForChild("Backpack")
+
+local plannedBuildsFolder = workspace:FindFirstChild("PlannedBuilds")
+if not plannedBuildsFolder then
+    plannedBuildsFolder = Instance.new("Folder", workspace)
+    plannedBuildsFolder.Name = "PlannedBuilds"
+end
+
+_G.LT2_AutoBuilder_Active = true
+
+local WC = {
+    Generic     = Color3.fromRGB(204,142,105), Oak        = Color3.fromRGB(234,184,146),
+    Cherry      = Color3.fromRGB(163, 75, 75), Fir        = Color3.fromRGB(215,197,154),
+    Birch       = Color3.fromRGB(205,205,205), Walnut     = Color3.fromRGB(105, 64, 40),
+    Koa         = Color3.fromRGB(143, 76, 42), Volcano    = Color3.fromRGB(255,  0,  0),
+    GreenSwampy = Color3.fromRGB( 52,142, 64), GoldSwampy = Color3.fromRGB(226,155, 64),
+    Palm        = Color3.fromRGB(226,220,188), SnowGlow   = Color3.fromRGB(255,255,  0),
+    Frost       = Color3.fromRGB(159,243,233), CaveCrawler= Color3.fromRGB( 16, 42,220),
+    BlueSpruce  = Color3.fromRGB(159,173,192), LoneCave   = Color3.fromRGB(248,248,248),
+    Spooky      = Color3.fromRGB(170, 85,  0), SpookyNeon = Color3.fromRGB(170, 85,  0)
+}
+
+local LT2_ExactSizes = {
+    ["Floor1"] = Vector3.new(4.000, 1.000, 4.000), ["Floor1Large"] = Vector3.new(8.000, 1.000, 8.000),
+    ["Floor1Small"] = Vector3.new(2.000, 1.000, 2.000), ["Floor1Tiny"] = Vector3.new(1.000, 1.000, 1.000),
+    ["Floor2"] = Vector3.new(4.000, 0.200, 4.000), ["Floor2Large"] = Vector3.new(8.000, 0.200, 8.000),
+    ["Floor2Small"] = Vector3.new(2.000, 0.200, 2.000), ["Floor2Tiny"] = Vector3.new(1.000, 0.200, 1.000),
+    ["Wall2"] = Vector3.new(4.000, 4.000, 1.000), ["Wall2Short"] = Vector3.new(4.000, 2.000, 1.000),
+    ["Wall2ShortThin"] = Vector3.new(2.000, 2.000, 1.000), ["Wall2Tall"] = Vector3.new(4.000, 8.000, 1.000),
+    ["Wall2TallThin"] = Vector3.new(2.000, 8.000, 1.000), ["Wall2Thin"] = Vector3.new(2.000, 4.000, 1.000),
+}
+
+local availableBlueprints = {}
+local excludedBlueprints = {} 
+for bpName, size in pairs(LT2_ExactSizes) do table.insert(availableBlueprints, {Name = bpName, Size = size}) end
+table.sort(availableBlueprints, function(a, b) return (a.Size.X * a.Size.Y * a.Size.Z) > (b.Size.X * b.Size.Y * b.Size.Z) end)
+
+local woodTypesList = {} for k, _ in pairs(WC) do table.insert(woodTypesList, k) end
+local currentWoodType = "Generic"
+
+local function isnetworkowner(Part) return Part.ReceiveAge == 0 end
+local function cleanCF(cf)
+    local x, y, z = math.floor(cf.X * 1000 + 0.5) / 1000, math.floor(cf.Y * 1000 + 0.5) / 1000, math.floor(cf.Z * 1000 + 0.5) / 1000
+    return CFrame.new(x, y, z) * (cf - cf.Position)
+end
+
+local function applyWoodStyle(part, woodType)
+    if WC[woodType] then part.Color = WC[woodType] end
+    part.Material = Enum.Material.Wood
+    if woodType == "Spooky" then part.Material = Enum.Material.Granite 
+    elseif woodType == "SpookyNeon" then part.Material = Enum.Material.Neon end
+    part.Transparency = 0.5; part.Anchored = true; part.CanCollide = false
+end
+
+local function getPermutations(v)
+    local angles = {
+        CFrame.Angles(0, 0, 0), CFrame.Angles(0, math.rad(90), 0),
+        CFrame.Angles(math.rad(90), 0, 0), CFrame.Angles(0, 0, math.rad(90)),
+        CFrame.Angles(math.rad(90), math.rad(90), 0), CFrame.Angles(math.rad(90), 0, math.rad(90))
+    }
+    local perms, seen = {}, {}
+    for i, rot in ipairs(angles) do
+        local rotatedVec = rot * v
+        local newSize = Vector3.new(math.floor(math.abs(rotatedVec.X) * 1000 + 0.5) / 1000, math.floor(math.abs(rotatedVec.Y) * 1000 + 0.5) / 1000, math.floor(math.abs(rotatedVec.Z) * 1000 + 0.5) / 1000)
+        local key = newSize.X .. "_" .. newSize.Y .. "_" .. newSize.Z
+        if not seen[key] then seen[key] = true table.insert(perms, {Size = newSize, Rot = rot, IsBase = (i == 1)}) end
+    end
+    return perms
+end
+
+local function fillVolume(targetSize)
+    local allowed = {} for _, bp in ipairs(availableBlueprints) do if not excludedBlueprints[bp.Name] then table.insert(allowed, bp) end end
+    local spaces, placed = {{Min = Vector3.zero, Max = targetSize}}, {}
+    local function spaceSize(s) return s.Max - s.Min end
+
+    while #spaces > 0 do
+        local space = table.remove(spaces, 1) local sSize = spaceSize(space)
+        local bestBp, bestPermInfo, bestScore = nil, nil, -1
+
+        for _, bp in ipairs(allowed) do
+            for _, permInfo in ipairs(getPermutations(bp.Size)) do
+                local perm = permInfo.Size
+                if perm.X <= sSize.X + 0.05 and perm.Y <= sSize.Y + 0.05 and perm.Z <= sSize.Z + 0.05 then
+                    local score = (perm.X * perm.Y * perm.Z) * 1000 
+                    if permInfo.IsBase then score = score + 50 end
+                    local lName = string.lower(bp.Name)
+                    if sSize.Y <= 1.1 and string.find(lName, "floor") then score = score + 50000 
+                    elseif sSize.Y >= 2.0 and string.find(lName, "wall") then score = score + 5000 end
+                    if score > bestScore then bestScore, bestBp, bestPermInfo = score, bp, permInfo end
+                end
+            end
+        end
+
+        if bestBp then
+            local perm = bestPermInfo.Size
+            table.insert(placed, { OriginalSize = bestBp.Size, Position = space.Min + perm / 2, BP_Name = bestBp.Name, Rot = bestPermInfo.Rot })
+            local w, h, d = perm.X, perm.Y, perm.Z
+            local W, H, D = sSize.X, sSize.Y, sSize.Z
+            local function addSpace(s) if spaceSize(s).X >= 0.15 and spaceSize(s).Y >= 0.15 and spaceSize(s).Z >= 0.15 then table.insert(spaces, s) end end
+            addSpace({Min = space.Min + Vector3.new(w, 0, 0), Max = space.Min + Vector3.new(W, h, d)})
+            addSpace({Min = space.Min + Vector3.new(0, h, 0), Max = space.Min + Vector3.new(W, H, d)})
+            addSpace({Min = space.Min + Vector3.new(0, 0, d), Max = space.Max})
+        end
+        if #placed > 800 then break end 
+    end
+    return placed
+end
+
+local function rebuildVisuals(model)
+    local bbox, visuals = model:FindFirstChild("BoundingBox"), model:FindFirstChild("Visuals")
+    if not bbox or not visuals then return end
+    visuals:ClearAllChildren()
+    local placedBlocks, woodType = fillVolume(bbox.Size), model:GetAttribute("WoodType") or "Generic"
+    
+    if #placedBlocks == 0 then
+        local p = Instance.new("Part", visuals) p.Size = bbox.Size p.CFrame = bbox.CFrame p.Color = Color3.fromRGB(255, 50, 50) p.Material = Enum.Material.Neon p.Transparency = 0.5 p.Anchored = true p.CanCollide = false
+        local out = Instance.new("SelectionBox", p) out.Adornee = p out.Color3 = Color3.fromRGB(255, 0, 0) out.LineThickness = 0.05 return
+    end
+    local cornerCF = bbox.CFrame * CFrame.new(-bbox.Size.X/2, -bbox.Size.Y/2, -bbox.Size.Z/2)
+    for _, blk in ipairs(placedBlocks) do
+        local p = Instance.new("Part", visuals) p.Size = blk.OriginalSize p.CFrame = cornerCF * CFrame.new(blk.Position) * (blk.Rot or CFrame.identity)
+        p:SetAttribute("BP_Name", blk.BP_Name) p:SetAttribute("WoodType", woodType) applyWoodStyle(p, woodType)
+        local out = Instance.new("SelectionBox", p) out.Adornee = p out.Color3 = WC[woodType] or Color3.new(1,1,1) out.LineThickness = 0.03
+    end
+end
+
+local function placeBaseBlock(cframe, size, woodType)
+    local model = Instance.new("Model") model:SetAttribute("WoodType", woodType)
+    local bbox = Instance.new("Part", model) bbox.Name = "BoundingBox" bbox.Size = size bbox.CFrame = cframe bbox.Transparency = 1 bbox.Anchored = true bbox.CanCollide = false
+    model.PrimaryPart = bbox
+    local visuals = Instance.new("Folder", model) visuals.Name = "Visuals"
+    model.Parent = plannedBuildsFolder rebuildVisuals(model)
+end
+
+_G.LT2_LoadSave = function(encodedStr)
+    if type(encodedStr) ~= "string" or #encodedStr < 4 then return end
+    local shift = tonumber(string.sub(encodedStr, 1, 2), 16)
+    local mult = tonumber(string.sub(encodedStr, 3, 4), 16)
+    local dataStr = ""
+    for i = 5, #encodedStr, 4 do
+        local chunk = string.sub(encodedStr, i, i + 3)
+        local val = tonumber(chunk, 16)
+        if val then dataStr = dataStr .. string.char((val / mult) - shift) end
+    end
+    for blockStr in string.gmatch(dataStr, "([^;]+)") do
+        local p = string.split(blockStr, "|")
+        if #p >= 10 then
+            local wType = p[1]
+            local size = Vector3.new(tonumber(p[2]), tonumber(p[3]), tonumber(p[4]))
+            local cf = CFrame.new(tonumber(p[5]), tonumber(p[6]), tonumber(p[7])) * CFrame.Angles(tonumber(p[8]), tonumber(p[9]), tonumber(p[10]))
+            placeBaseBlock(cf, size, wType)
+        end
+    end
+    print("✅ Build successfully loaded!")
+end
+
+local tool1 = Instance.new("Tool", backpack) tool1.Name = "1. BP Manager" tool1.RequiresHandle = false
+local tool2 = Instance.new("Tool", backpack) tool2.Name = "2. Builder" tool2.RequiresHandle = false
+local tool3 = Instance.new("Tool", backpack) tool3.Name = "3. Resizer" tool3.RequiresHandle = false
+
+local guiManager = Instance.new("ScreenGui", player.PlayerGui) guiManager.Enabled = false
+local frameManager = Instance.new("ScrollingFrame", guiManager)
+frameManager.Size = UDim2.new(0, 250, 0, 400) frameManager.Position = UDim2.new(0.1, 0, 0.2, 0) frameManager.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+local listLayout = Instance.new("UIListLayout", frameManager) listLayout.Padding = UDim.new(0, 5)
+
+for _, bp in ipairs(availableBlueprints) do
+    local btn = Instance.new("TextButton", frameManager) btn.Size = UDim2.new(1, -10, 0, 30) btn.Text = "✔️ " .. bp.Name btn.BackgroundColor3 = Color3.fromRGB(50, 150, 50) btn.TextColor3 = Color3.new(1,1,1)
+    btn.MouseButton1Click:Connect(function()
+        if excludedBlueprints[bp.Name] then excludedBlueprints[bp.Name] = nil btn.Text = "✔️ " .. bp.Name btn.BackgroundColor3 = Color3.fromRGB(50, 150, 50)
+        else excludedBlueprints[bp.Name] = true btn.Text = "❌ " .. bp.Name btn.BackgroundColor3 = Color3.fromRGB(150, 50, 50) end
+    end)
+end
+tool1.Equipped:Connect(function() guiManager.Enabled = true end) tool1.Unequipped:Connect(function() guiManager.Enabled = false end)
+
+local previewPart = Instance.new("Part") previewPart.Size = Vector3.new(4, 1, 4) previewPart.Anchored = true previewPart.CanCollide = false previewPart.Transparency = 0.5
+local previewOutline = Instance.new("SelectionBox", previewPart) previewOutline.Adornee = previewPart
+local guiHammer = Instance.new("ScreenGui", player.PlayerGui) guiHammer.Enabled = false
+local woodLabel = Instance.new("TextLabel", guiHammer) woodLabel.Size = UDim2.new(0, 250, 0, 40) woodLabel.Position = UDim2.new(0.5, -125, 0.8, -45) woodLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 20) woodLabel.TextColor3 = Color3.new(1,1,1)
+
+local isTool2Eq, renderConn2 = false, nil
+tool2.Equipped:Connect(function()
+    isTool2Eq = true guiHammer.Enabled = true previewPart.Parent = workspace mouse.TargetFilter = previewPart woodLabel.Text = "Wood: " .. currentWoodType .. "\n[R] Switch"
+    renderConn2 = RunService.RenderStepped:Connect(function()
+        if mouse.Hit then
+            previewPart.CFrame = CFrame.new(math.floor(mouse.Hit.Position.X) + 0.5, math.floor(mouse.Hit.Position.Y) + 0.5, math.floor(mouse.Hit.Position.Z) + 0.5)
+            applyWoodStyle(previewPart, currentWoodType) previewOutline.Color3 = WC[currentWoodType] or Color3.new(1,1,1)
+        end
+    end)
+end)
+tool2.Unequipped:Connect(function() isTool2Eq = false guiHammer.Enabled = false previewPart.Parent = nil mouse.TargetFilter = nil if renderConn2 then renderConn2:Disconnect() end end)
+
+local handlesGui = Instance.new("ScreenGui", player.PlayerGui) handlesGui.Enabled = false
+local resizeHandles = Instance.new("Handles", handlesGui) resizeHandles.Style = Enum.HandlesStyle.Resize resizeHandles.Color3 = Color3.fromRGB(0, 172, 240)
+local currentAdorneeModel, dragStartSize, dragStartCFrame = nil, Vector3.zero, CFrame.identity
+local faceVectors = { [Enum.NormalId.Front] = Vector3.new(0, 0, -1), [Enum.NormalId.Back] = Vector3.new(0, 0, 1), [Enum.NormalId.Top] = Vector3.new(0, 1, 0), [Enum.NormalId.Bottom] = Vector3.new(0, -1, 0), [Enum.NormalId.Right] = Vector3.new(1, 0, 0), [Enum.NormalId.Left] = Vector3.new(-1, 0, 0) }
+local isTool3Eq = false
+tool3.Equipped:Connect(function() isTool3Eq = true handlesGui.Enabled = true end) tool3.Unequipped:Connect(function() isTool3Eq = false handlesGui.Enabled = false resizeHandles.Adornee = nil currentAdorneeModel = nil end)
+resizeHandles.MouseButton1Down:Connect(function(face) if currentAdorneeModel and currentAdorneeModel:FindFirstChild("BoundingBox") then dragStartSize, dragStartCFrame = currentAdorneeModel.BoundingBox.Size, currentAdorneeModel.BoundingBox.CFrame end end)
+resizeHandles.MouseDrag:Connect(function(face, distance)
+    if not currentAdorneeModel or not currentAdorneeModel:FindFirstChild("BoundingBox") then return end
+    local fVec, snap = faceVectors[face], 0.2
+    local snappedDist = math.floor((distance + snap/2) / snap) * snap
+    local currentDim = math.abs(fVec.X * dragStartSize.X + fVec.Y * dragStartSize.Y + fVec.Z * dragStartSize.Z)
+    if currentDim + snappedDist < 0.2 then snappedDist = 0.2 - currentDim end
+    currentAdorneeModel.BoundingBox.Size = dragStartSize + Vector3.new(math.abs(fVec.X), math.abs(fVec.Y), math.abs(fVec.Z)) * snappedDist
+    currentAdorneeModel.BoundingBox.CFrame = dragStartCFrame * CFrame.new(fVec * (snappedDist / 2))
+    rebuildVisuals(currentAdorneeModel)
+end)
+
+local tool4 = Instance.new("Tool", backpack) tool4.Name = "4. Screwdriver" tool4.RequiresHandle = false
+local arcGui = Instance.new("ScreenGui", player.PlayerGui) arcGui.Enabled = false
+local arcHandles = Instance.new("ArcHandles", arcGui) arcHandles.Axes = Axes.new(Enum.Axis.X, Enum.Axis.Y, Enum.Axis.Z) arcHandles.Color3 = Color3.fromRGB(255, 150, 0)
+local moveHandles = Instance.new("Handles", arcGui) moveHandles.Style = Enum.HandlesStyle.Movement moveHandles.Color3 = Color3.fromRGB(50, 255, 50)
+
+local screwGui = Instance.new("ScreenGui", player.PlayerGui) screwGui.Enabled = false
+local screwFrame = Instance.new("Frame", screwGui) screwFrame.Size = UDim2.new(0, 160, 0, 110) screwFrame.Position = UDim2.new(0.5, -80, 0.8, -130) screwFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+
+local currentTool4Mode = "Rotate"
+local btnToggle = Instance.new("TextButton", screwFrame) btnToggle.Size = UDim2.new(1, -10, 0, 30) btnToggle.Position = UDim2.new(0, 5, 0, 5) btnToggle.BackgroundColor3 = Color3.fromRGB(255, 150, 0) btnToggle.TextColor3 = Color3.new(1,1,1) btnToggle.Text = "Mode: ROTATE" btnToggle.Font = Enum.Font.SourceSansBold btnToggle.TextSize = 14
+local lblRot = Instance.new("TextLabel", screwFrame) lblRot.Size = UDim2.new(0, 70, 0, 20) lblRot.Position = UDim2.new(0, 5, 0, 40) lblRot.BackgroundTransparency = 1 lblRot.TextColor3 = Color3.new(1,1,1) lblRot.Text = "Angle:"
+local angleInput = Instance.new("TextBox", screwFrame) angleInput.Size = UDim2.new(0, 70, 0, 30) angleInput.Position = UDim2.new(0, 5, 0, 60) angleInput.BackgroundColor3 = Color3.fromRGB(50,50,50) angleInput.TextColor3 = Color3.new(1,1,1) angleInput.Text = "90"
+local lblMov = Instance.new("TextLabel", screwFrame) lblMov.Size = UDim2.new(0, 70, 0, 20) lblMov.Position = UDim2.new(0, 85, 0, 40) lblMov.BackgroundTransparency = 1 lblMov.TextColor3 = Color3.new(1,1,1) lblMov.Text = "Step:"
+local moveInput = Instance.new("TextBox", screwFrame) moveInput.Size = UDim2.new(0, 70, 0, 30) moveInput.Position = UDim2.new(0, 85, 0, 60) moveInput.BackgroundColor3 = Color3.fromRGB(50,50,50) moveInput.TextColor3 = Color3.new(1,1,1) moveInput.Text = "0.2"
+
+local isTool4Eq = false
+tool4.Equipped:Connect(function() isTool4Eq = true arcGui.Enabled = true screwGui.Enabled = true end)
+tool4.Unequipped:Connect(function() isTool4Eq = false arcGui.Enabled = false screwGui.Enabled = false arcHandles.Adornee = nil moveHandles.Adornee = nil currentAdorneeModel = nil end)
+
+btnToggle.MouseButton1Click:Connect(function()
+    if currentTool4Mode == "Rotate" then
+        currentTool4Mode = "Move" btnToggle.Text = "Mode: MOVE" btnToggle.BackgroundColor3 = Color3.fromRGB(50, 200, 50) moveHandles.Color3 = Color3.fromRGB(50, 255, 50)
+        if currentAdorneeModel then arcHandles.Adornee = nil moveHandles.Adornee = currentAdorneeModel.BoundingBox end
+    elseif currentTool4Mode == "Move" then
+        currentTool4Mode = "Clone" btnToggle.Text = "Mode: CLONE" btnToggle.BackgroundColor3 = Color3.fromRGB(200, 50, 255) moveHandles.Color3 = Color3.fromRGB(200, 50, 255)
+        if currentAdorneeModel then arcHandles.Adornee = nil moveHandles.Adornee = currentAdorneeModel.BoundingBox end
+    else
+        currentTool4Mode = "Rotate" btnToggle.Text = "Mode: ROTATE" btnToggle.BackgroundColor3 = Color3.fromRGB(255, 150, 0)
+        if currentAdorneeModel then moveHandles.Adornee = nil arcHandles.Adornee = currentAdorneeModel.BoundingBox end
+    end
+end)
+
+local arcStartCFrame = CFrame.identity
+arcHandles.MouseButton1Down:Connect(function() if currentAdorneeModel then arcStartCFrame = currentAdorneeModel.BoundingBox.CFrame end end)
+arcHandles.MouseDrag:Connect(function(axis, relativeAngle)
+    if not currentAdorneeModel then return end
+    local snapAngle = math.rad(tonumber(angleInput.Text) or 90)
+    local snappedRel = math.floor(relativeAngle / snapAngle + 0.5) * snapAngle
+    currentAdorneeModel.BoundingBox.CFrame = arcStartCFrame * CFrame.Angles(axis == Enum.Axis.X and snappedRel or 0, axis == Enum.Axis.Y and snappedRel or 0, axis == Enum.Axis.Z and snappedRel or 0)
+    rebuildVisuals(currentAdorneeModel)
+end)
+
+local moveStartCFrame = CFrame.identity
+moveHandles.MouseButton1Down:Connect(function(face)
+    if not currentAdorneeModel or not currentAdorneeModel:FindFirstChild("BoundingBox") then return end
+    if currentTool4Mode == "Clone" then
+        local newModel = Instance.new("Model") newModel:SetAttribute("WoodType", currentAdorneeModel:GetAttribute("WoodType"))
+        local newBBox = Instance.new("Part", newModel) newBBox.Name = "BoundingBox" newBBox.Size = currentAdorneeModel.BoundingBox.Size newBBox.CFrame = currentAdorneeModel.BoundingBox.CFrame newBBox.Transparency = 1 newBBox.Anchored = true newBBox.CanCollide = false
+        newModel.PrimaryPart = newBBox
+        local newVisuals = Instance.new("Folder", newModel) newVisuals.Name = "Visuals"
+        newModel.Parent = plannedBuildsFolder rebuildVisuals(newModel)
+        currentAdorneeModel = newModel moveHandles.Adornee = newModel.BoundingBox
+    end
+    moveStartCFrame = currentAdorneeModel.BoundingBox.CFrame
+end)
+moveHandles.MouseDrag:Connect(function(face, distance)
+    if not currentAdorneeModel then return end
+    local snap = tonumber(moveInput.Text) or 0.2
+    local snappedDist = math.floor((distance + snap/2) / snap) * snap
+    currentAdorneeModel.BoundingBox.CFrame = moveStartCFrame * CFrame.new(faceVectors[face] * snappedDist)
+    rebuildVisuals(currentAdorneeModel)
+end)
+
+local tool6 = Instance.new("Tool", backpack) tool6.Name = "6. Paintbrush" tool6.RequiresHandle = false
+local isTool6Eq, isPainting = false, false
+tool6.Equipped:Connect(function() isTool6Eq = true guiHammer.Enabled = true woodLabel.Text = "Brush: " .. currentWoodType .. "\n[Hold LMB]" end)
+tool6.Unequipped:Connect(function() isTool6Eq = false guiHammer.Enabled = false isPainting = false end)
+
+RunService.RenderStepped:Connect(function()
+    if isTool6Eq and isPainting and mouse.Target then
+        local model = mouse.Target:FindFirstAncestorWhichIsA("Model")
+        if model and model:IsDescendantOf(plannedBuildsFolder) and model:GetAttribute("WoodType") ~= currentWoodType then
+            model:SetAttribute("WoodType", currentWoodType)
+            local vis = model:FindFirstChild("Visuals")
+            if vis then
+                for _, p in ipairs(vis:GetChildren()) do
+                    p:SetAttribute("WoodType", currentWoodType) applyWoodStyle(p, currentWoodType)
+                    local out = p:FindFirstChildWhichIsA("SelectionBox") if out then out.Color3 = WC[currentWoodType] or Color3.new(1,1,1) end
+                end
+            end
+        end
+    end
+end)
+
+local tool5 = Instance.new("Tool", backpack) tool5.Name = "5. Auto-Builder" tool5.RequiresHandle = false
+local autoGui = Instance.new("ScreenGui", player.PlayerGui) autoGui.Enabled = false
+local autoFrame = Instance.new("Frame", autoGui) autoFrame.Size = UDim2.new(0, 200, 0, 100) autoFrame.Position = UDim2.new(0.5, -100, 0.8, -100) autoFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+local btnBuild = Instance.new("TextButton", autoFrame) btnBuild.Size = UDim2.new(0, 180, 0, 50) btnBuild.Position = UDim2.new(0.5, -90, 0, 35) btnBuild.BackgroundColor3 = Color3.fromRGB(50, 150, 50) btnBuild.TextColor3 = Color3.new(1,1,1) btnBuild.Text = "START: BUILD" btnBuild.Font = Enum.Font.SourceSansBold btnBuild.TextSize = 14
+
+tool5.Equipped:Connect(function() autoGui.Enabled = true end)
+tool5.Unequipped:Connect(function() autoGui.Enabled = false end)
+
+local function isValidWoodSize(size) return math.max(size.X, size.Y, size.Z) <= 3.5 and math.min(size.X, size.Y, size.Z) >= 0.1 end
+
+btnBuild.MouseButton1Click:Connect(function()
+    btnBuild.Text = "CALCULATING..."
+    local planned = {}
+    for _, model in pairs(plannedBuildsFolder:GetChildren()) do
+        local visuals = model:FindFirstChild("Visuals")
+        if visuals then
+            for _, part in pairs(visuals:GetChildren()) do
+                if part.Color ~= Color3.fromRGB(255, 50, 50) then 
+                    table.insert(planned, { bpName = part:GetAttribute("BP_Name"), cframe = cleanCF(part.CFrame), woodType = model:GetAttribute("WoodType") or "Generic", visualPart = part })
+                end
+            end
+        end
+    end
+    if #planned == 0 then btnBuild.Text = "NO BLUEPRINTS" task.wait(2) btnBuild.Text = "START: BUILD" return end
+
+    local availableWood = {}
+    for _, v in pairs(workspace.PlayerModels:GetChildren()) do
+        if v:FindFirstChild("WoodSection") and v:FindFirstChild("Owner") and v.Owner.Value == player and isValidWoodSize(v.WoodSection.Size) then 
+            table.insert(availableWood, {model = v, primary = v.WoodSection, woodType = (v:FindFirstChild("TreeClass") and v.TreeClass.Value or "Generic"), used = false}) 
+        end
+    end
+    
+    local requiredWoodCounts, foundWoodCounts = {}, {}
+    for _, plan in ipairs(planned) do requiredWoodCounts[plan.woodType] = (requiredWoodCounts[plan.woodType] or 0) + 1 end
+    for _, w in ipairs(availableWood) do foundWoodCounts[w.woodType] = (foundWoodCounts[w.woodType] or 0) + 1 end
+
+    for wType, count in pairs(requiredWoodCounts) do
+        local found = foundWoodCounts[wType] or 0
+        if found < count then
+            btnBuild.Text = "❌ NOT ENOUGH: " .. string.upper(wType) btnBuild.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+            warn("❌ ERROR: Need " .. count .. " pieces of " .. wType .. ", but only found " .. found .. "!")
+            task.wait(3) btnBuild.Text = "START: BUILD" btnBuild.BackgroundColor3 = Color3.fromRGB(50, 150, 50) return
+        end
+    end
+    
+    btnBuild.Text = "BUILDING..."
+    local dragRemote = ReplicatedStorage.Interaction:FindFirstChild("ClientIsDragging")
+    local placeRemote = ReplicatedStorage:FindFirstChild("PlaceStructure") and ReplicatedStorage.PlaceStructure:FindFirstChild("ClientPlacedBlueprint")
+    
+    for i, plan in ipairs(planned) do
+        local selectedWood = nil
+        for _, w in ipairs(availableWood) do if not w.used and w.woodType == plan.woodType then selectedWood = w w.used = true break end end
+        if selectedWood and dragRemote and placeRemote then
+            placeRemote:FireServer(plan.bpName, plan.cframe, player) task.wait(0.3) 
+            player.Character.HumanoidRootPart.CFrame = selectedWood.primary.CFrame + Vector3.new(0, 3, 0) task.wait(0.1)
+            
+            local t = tick()
+            while not isnetworkowner(selectedWood.primary) and tick() - t < 1.5 do
+                player.Character.HumanoidRootPart.CFrame = selectedWood.primary.CFrame + Vector3.new(0, 3, 0)
+                player.Character.HumanoidRootPart.AssemblyLinearVelocity = Vector3.zero dragRemote:FireServer(selectedWood.model) task.wait()
+            end
+            
+            dragRemote:FireServer(selectedWood.model) selectedWood.model:PivotTo(plan.cframe + Vector3.new(0, 1.5, 0))
+            for _, p in pairs(selectedWood.model:GetDescendants()) do if p:IsA("BasePart") then p.AssemblyLinearVelocity = Vector3.new(0,-10,0) p.AssemblyAngularVelocity = Vector3.zero end end
+            pcall(function() dragRemote:FireServer(nil) end) plan.visualPart:Destroy() task.wait(0.2) 
+        end
+    end
+    btnBuild.BackgroundColor3 = Color3.fromRGB(50, 150, 50) btnBuild.Text = "START: BUILD"
+end)
+
+local tool7 = Instance.new("Tool", backpack) tool7.Name = "7. Save / Export" tool7.RequiresHandle = false
+local saveGui = Instance.new("ScreenGui", player.PlayerGui) saveGui.Enabled = false
+local saveFrame = Instance.new("Frame", saveGui) saveFrame.Size = UDim2.new(0, 500, 0, 300) saveFrame.Position = UDim2.new(0.5, -250, 0.5, -150) saveFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+local txtCode = Instance.new("TextBox", saveFrame) txtCode.Size = UDim2.new(1, -20, 1, -60) txtCode.Position = UDim2.new(0, 10, 0, 10) txtCode.TextEditable = false txtCode.ClearTextOnFocus = false txtCode.MultiLine = true txtCode.TextXAlignment = Enum.TextXAlignment.Left txtCode.TextYAlignment = Enum.TextYAlignment.Top txtCode.TextColor3 = Color3.new(1,1,1) txtCode.BackgroundColor3 = Color3.fromRGB(15,15,15)
+local btnCloseSave = Instance.new("TextButton", saveFrame) btnCloseSave.Size = UDim2.new(1, -20, 0, 30) btnCloseSave.Position = UDim2.new(0, 10, 1, -40) btnCloseSave.Text = "COPY TO CLIPBOARD & CLOSE" btnCloseSave.BackgroundColor3 = Color3.fromRGB(200, 50, 50) btnCloseSave.TextColor3 = Color3.new(1,1,1) btnCloseSave.Font = Enum.Font.SourceSansBold btnCloseSave.TextSize = 16
+
+local function generateRandomName()
+    local res = ""
+    for i = 1, math.random(8, 14) do res = res .. string.char(math.random(97, 122)) end
+    return res
+end
+
+btnCloseSave.MouseButton1Click:Connect(function() 
+    if setclipboard then
+        pcall(function() setclipboard(txtCode.Text) end)
+        btnCloseSave.Text = "COPIED!"
+        task.wait(1)
+        btnCloseSave.Text = "COPY TO CLIPBOARD & CLOSE"
+    end
+    saveGui.Enabled = false 
+end)
+
+tool7.Equipped:Connect(function()
+    local dataStr = ""
+    for _, model in pairs(plannedBuildsFolder:GetChildren()) do
+        local bbox = model:FindFirstChild("BoundingBox")
+        if bbox then
+            local wT = model:GetAttribute("WoodType") or "Generic"
+            local s = bbox.Size
+            local x,y,z = bbox.CFrame.X, bbox.CFrame.Y, bbox.CFrame.Z
+            local rx,ry,rz = bbox.CFrame:ToEulerAnglesXYZ()
+            dataStr = dataStr .. string.format("%s|%.3f|%.3f|%.3f|%.3f|%.3f|%.3f|%.3f|%.3f|%.3f;", wT, s.X, s.Y, s.Z, x, y, z, rx, ry, rz)
+        end
+    end
+    
+    local shift = math.random(15, 60)
+    local mult = math.random(2, 6)
+    local hexStr = string.format("%02X%02X", shift, mult)
+    for i=1, #dataStr do 
+        local b = string.byte(dataStr, i)
+        local calc = (b + shift) * mult
+        hexStr = hexStr .. string.format("%04X", calc)
+    end
+    
+    local junkVar = generateRandomName()
+    local junkFunc = generateRandomName()
+    local junk1 = "local " .. junkVar .. " = " .. tostring(math.random(10000, 99999)) .. ";\n"
+    local junk2 = "local function " .. junkFunc .. "() return '" .. generateRandomName() .. "' end;\n"
+    
+    local sc = "if not _G.LT2_AutoBuilder_Active then warn('❌ ERROR: Run the main Auto-Builder script first!') return end\n"
+    sc = sc .. junk1 .. junk2
+    sc = sc .. "local " .. generateRandomName() .. " = '" .. hexStr .. "';\n"
+    sc = sc .. "if _G.LT2_LoadSave then _G.LT2_LoadSave('" .. hexStr .. "') else print(" .. junkVar .. ") end\n"
+
+    txtCode.Text = sc
+    saveGui.Enabled = true
+end)
+
+local isDraggingPlan, planOffsets, dragPlanRenderConn = false, {}, nil
+
+local keyConn = UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    
+    if isTool6Eq and input.UserInputType == Enum.UserInputType.MouseButton1 then isPainting = true end
+    
+    if isTool2Eq and input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if previewPart.Parent and mouse.Hit then placeBaseBlock(previewPart.CFrame, previewPart.Size, currentWoodType) end
+    end
+
+    if (isTool3Eq or isTool4Eq) and input.UserInputType == Enum.UserInputType.MouseButton1 then
+        local target = mouse.Target
+        if target and target:IsDescendantOf(plannedBuildsFolder) then
+            currentAdorneeModel = target:FindFirstAncestorWhichIsA("Model")
+            if currentAdorneeModel and currentAdorneeModel:FindFirstChild("BoundingBox") then
+                if isTool3Eq then resizeHandles.Adornee = currentAdorneeModel.BoundingBox end
+                if isTool4Eq then 
+                    if currentTool4Mode == "Rotate" then arcHandles.Adornee = currentAdorneeModel.BoundingBox moveHandles.Adornee = nil
+                    else moveHandles.Adornee = currentAdorneeModel.BoundingBox arcHandles.Adornee = nil end
+                end
+            end
+        else
+            if isTool3Eq then resizeHandles.Adornee = nil end
+            if isTool4Eq then arcHandles.Adornee = nil moveHandles.Adornee = nil end
+            currentAdorneeModel = nil
+        end
+    end
+    
+    if input.KeyCode == Enum.KeyCode.X then
+        local tools = {tool1, tool2, tool3, tool4, tool5, tool6, tool7}
+        for _, t in ipairs(tools) do if t then t:Destroy() end end
+        if guiManager then guiManager:Destroy() end if guiHammer then guiHammer:Destroy() end
+        if handlesGui then handlesGui:Destroy() end if arcGui then arcGui:Destroy() end
+        if screwGui then screwGui:Destroy() end if autoGui then autoGui:Destroy() end
+        if saveGui then saveGui:Destroy() end
+        if plannedBuildsFolder then plannedBuildsFolder:Destroy() end
+        keyConn:Disconnect() return
+    end
+    
+    if input.KeyCode == Enum.KeyCode.R and (isTool2Eq or isTool6Eq) then
+        local idx = table.find(woodTypesList, currentWoodType) or 1
+        currentWoodType = woodTypesList[(idx % #woodTypesList) + 1]
+        woodLabel.Text = (isTool6Eq and "Brush: " or "Wood: ") .. currentWoodType .. "\n[R] Switch"
+    end
+
+    if input.KeyCode == Enum.KeyCode.P then
+        if not isDraggingPlan then
+            local minX, minY, minZ = math.huge, math.huge, math.huge
+            local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+            local count = 0
+
+            for _, model in ipairs(plannedBuildsFolder:GetChildren()) do
+                if model.PrimaryPart then
+                    local pos = model.PrimaryPart.Position
+                    if pos.X < minX then minX = pos.X end if pos.Y < minY then minY = pos.Y end if pos.Z < minZ then minZ = pos.Z end
+                    if pos.X > maxX then maxX = pos.X end if pos.Y > maxY then maxY = pos.Y end if pos.Z > maxZ then maxZ = pos.Z end
+                    count = count + 1
+                end
+            end
+
+            if count > 0 then
+                local centerX, centerZ = math.floor((minX + maxX) / 2) + 0.5, math.floor((minZ + maxZ) / 2) + 0.5
+                local originalCenter = CFrame.new(centerX, minY, centerZ)
+                
+                planOffsets = {}
+                for _, model in ipairs(plannedBuildsFolder:GetChildren()) do
+                    if model.PrimaryPart then planOffsets[model] = originalCenter:ToObjectSpace(model.PrimaryPart.CFrame) end
+                end
+                
+                isDraggingPlan = true
+                mouse.TargetFilter = plannedBuildsFolder
+                
+                dragPlanRenderConn = RunService.RenderStepped:Connect(function()
+                    if mouse.Hit then
+                        local pos = mouse.Hit.Position
+                        local newCenter = CFrame.new(math.floor(pos.X) + 0.5, math.floor(pos.Y) + 0.5, math.floor(pos.Z) + 0.5)
+                        for model, offset in pairs(planOffsets) do
+                            if model and model.Parent then model:PivotTo(newCenter * offset) end
+                        end
+                    end
+                end)
+            end
+        else
+            isDraggingPlan = false
+            if dragPlanRenderConn then dragPlanRenderConn:Disconnect() end
+            mouse.TargetFilter = (isTool2Eq and previewPart) or nil
+        end
+    end
+
+    if isDraggingPlan and input.UserInputType == Enum.UserInputType.MouseButton1 then
+        isDraggingPlan = false
+        if dragPlanRenderConn then dragPlanRenderConn:Disconnect() end
+        mouse.TargetFilter = (isTool2Eq and previewPart) or nil
+    end
+
+    if isDraggingPlan and input.KeyCode == Enum.KeyCode.R then
+        local rot = CFrame.Angles(0, math.rad(90), 0)
+        for model, offset in pairs(planOffsets) do planOffsets[model] = rot * offset end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input, gp)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then isPainting = false end
+end)
+
+print([[
+LT2 Auto-Builder started. Controls:
+
+Global:
+[X] - Close script.
+[P] - Move entire project.
+[R] (while moving) - Rotate project 90 degrees.
+
+Tools 2 (Builder) & 6 (Paintbrush):
+[LMB] - Place hologram / paint.
+[R] - Change wood.
+
+Tools 3 (Resizer) & 4 (Screwdriver):
+[LMB] - Select part and drag.
+
+Tool 5 (Auto-Builder):
+"START" button - begin auto-build.
+]])
