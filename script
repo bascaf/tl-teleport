@@ -1,0 +1,163 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+
+local player = Players.LocalPlayer
+local mouse = player:GetMouse()
+
+local function getCurrentVehicle()
+    local character = player.Character
+    if character and character:FindFirstChild("Humanoid") then
+        local seat = character.Humanoid.SeatPart
+        if seat then
+            local vehicle = seat:FindFirstAncestorWhichIsA("Model")
+            while vehicle and vehicle.Parent and vehicle.Parent ~= workspace and vehicle.Parent.Name ~= "PlayerModels" do
+                local nextAncestor = vehicle.Parent:FindFirstAncestorWhichIsA("Model")
+                if nextAncestor then
+                    vehicle = nextAncestor
+                else
+                    break
+                end
+            end
+            return vehicle
+        end
+    end
+    return nil
+end
+
+local RealVehicle = getCurrentVehicle()
+
+if not RealVehicle then
+    warn("Vehicle not found! Please sit in a seat.")
+    return
+end
+
+RealVehicle.Archivable = true
+local GhostVehicle = RealVehicle:Clone()
+RealVehicle.Archivable = false
+
+for _, v in pairs(GhostVehicle:GetDescendants()) do
+    if v:IsA("BasePart") or v:IsA("UnionOperation") then
+        v.Anchored = true
+        v.CanCollide = false
+        v.CanTouch = false
+        v.CanQuery = false
+        v.Transparency = 0.5
+        v.BrickColor = BrickColor.new("Medium stone grey")
+        v.Material = Enum.Material.SmoothPlastic
+    elseif v:IsA("Script") or v:IsA("LocalScript") or v:IsA("JointInstance") then
+        v:Destroy()
+    end
+end
+GhostVehicle.Parent = workspace
+
+local currentRotation = 0
+local isActive = true
+
+local RenderConnection
+RenderConnection = RunService.RenderStepped:Connect(function()
+    if not isActive then return end
+    
+    local targetPos
+    if UserInputService.TouchEnabled and not UserInputService.MouseEnabled then
+        local touchLocation = UserInputService:GetMouseLocation()
+        local ray = workspace.CurrentCamera:ViewportPointToRay(touchLocation.X, touchLocation.Y)
+        local raycastResult = workspace:Raycast(ray.Origin, ray.Direction * 1000)
+        targetPos = raycastResult and raycastResult.Position or (ray.Origin + ray.Direction * 20)
+    else
+        targetPos = mouse.Hit and mouse.Hit.Position or Vector3.zero
+    end
+
+    local targetCFrame = CFrame.new(targetPos) * CFrame.new(0, 2, 0) * CFrame.Angles(0, currentRotation, 0)
+    GhostVehicle:PivotTo(targetCFrame)
+end)
+
+local function finishTeleport()
+    if not isActive then return end
+    isActive = false
+    
+    RenderConnection:Disconnect()
+    ContextActionService:UnbindAction("Rotate10")
+    ContextActionService:UnbindAction("Rotate45")
+    ContextActionService:UnbindAction("FinishTP")
+
+    local targetCFrame = GhostVehicle:GetPivot()
+    GhostVehicle:Destroy()
+
+    local vehiclePivot = RealVehicle:GetPivot() 
+    local boxCFrame, boxSize = RealVehicle:GetBoundingBox()
+    
+    local searchSize = boxSize + Vector3.new(6, 20, 6) 
+    local searchCFrame = boxCFrame * CFrame.new(0, 5, 0)
+
+    local overlapParams = OverlapParams.new()
+    overlapParams.FilterDescendantsInstances = {RealVehicle, player.Character}
+    overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+
+    local partsInBox = workspace:GetPartBoundsInBox(searchCFrame, searchSize, overlapParams)
+    
+    local itemsData = {}
+    local processedModels = {}
+
+    for _, part in ipairs(partsInBox) do
+        if not part.Anchored then
+            local model = part:FindFirstAncestorWhichIsA("Model")
+            if model and model ~= workspace and not processedModels[model] and not Players:GetPlayerFromCharacter(model) then
+                processedModels[model] = true
+                local relativeOffset = vehiclePivot:ToObjectSpace(model:GetPivot())
+                table.insert(itemsData, {Model = model, Offset = relativeOffset})
+            end
+        end
+    end
+
+    for _, v in pairs(RealVehicle:GetDescendants()) do
+        if v:IsA("BasePart") then
+            v:SetAttribute("OldCanQuery", v.CanQuery)
+            v.CanQuery = false
+        end
+    end
+
+    RealVehicle:PivotTo(targetCFrame)
+    RunService.Stepped:Wait() 
+
+    for _, item in ipairs(itemsData) do
+        local newWorldCFrame = targetCFrame * item.Offset + (targetCFrame.UpVector * 1)
+        item.Model:PivotTo(newWorldCFrame)
+        for _, v in pairs(item.Model:GetDescendants()) do
+            if v:IsA("BasePart") then
+                v.AssemblyLinearVelocity = Vector3.zero
+                v.AssemblyAngularVelocity = Vector3.zero
+            end
+        end
+    end
+
+    task.wait(0.1)
+    for _, v in pairs(RealVehicle:GetDescendants()) do
+        if v:IsA("BasePart") then
+            v.CanQuery = v:GetAttribute("OldCanQuery") or true
+        end
+    end
+    
+    print("Successfully teleported vehicle and " .. #itemsData .. " items!")
+end
+
+local function handleAction(actionName, inputState, inputObject)
+    if inputState ~= Enum.UserInputState.Begin then return end
+
+    if actionName == "Rotate10" then
+        currentRotation = currentRotation + math.rad(10)
+    elseif actionName == "Rotate45" then
+        currentRotation = currentRotation + math.rad(45)
+    elseif actionName == "FinishTP" then
+        finishTeleport()
+    end
+end
+
+ContextActionService:BindAction("Rotate10", handleAction, true, Enum.KeyCode.R)
+ContextActionService:BindAction("Rotate45", handleAction, true, Enum.KeyCode.T)
+ContextActionService:BindAction("FinishTP", handleAction, true, Enum.KeyCode.F)
+
+ContextActionService:SetTitle("Rotate10", "Rotate 10")
+ContextActionService:SetTitle("Rotate45", "Rotate 45")
+ContextActionService:SetTitle("FinishTP", "Finish")
